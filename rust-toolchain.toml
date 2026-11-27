@@ -1,0 +1,5 @@
+# Pinned on purpose. rustc 1.78 dropped Windows 7 support, and the agent has to
+# run on Windows 7. Do not bump this without dropping Windows 7 support.
+[toolchain]
+channel = "1.77.1"
+profile = "minimal"

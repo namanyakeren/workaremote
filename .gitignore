@@ -1,0 +1,4 @@
+target/
+worka-state.json
+worka-state.tmp
+*.exe

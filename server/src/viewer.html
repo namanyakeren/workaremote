@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worka Remote</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #bar { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px;
+    background: #161b22; border-bottom: 1px solid #21262d; }
+  #bar b { color: #58a6ff; font-weight: 600; }
+  #bar .sp { flex: 1; }
+  #bar .stat { color: #8b949e; font-variant-numeric: tabular-nums; }
+  select, button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { background: #30363d; }
+  #wrap { position: absolute; inset: 40px 0 0 0; display: flex; }
+  #screen { width: 100%; height: 100%; display: block; outline: none; cursor: crosshair; }
+  #overlay { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: rgba(13,17,23,.82); backdrop-filter: blur(3px);
+    z-index: 5; }
+  #overlay.hide { display: none; }
+  #card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 26px 30px; min-width: 320px; max-width: 420px; text-align: center; }
+  #card h1 { margin: 0 0 6px; font-size: 17px; }
+  #card p { margin: 6px 0 16px; color: #8b949e; }
+  #card input { width: 100%; padding: 9px 11px; border-radius: 6px; border: 1px solid #30363d;
+    background: #0d1117; color: inherit; font: inherit; margin-bottom: 10px; }
+  #card .row { display: flex; gap: 8px; justify-content: center; }
+  #card .primary { background: #238636; border-color: #2ea043; }
+  #card .primary:hover { background: #2ea043; }
+  #tools { display:flex; gap:6px; align-items:center; }
+  .spin { width: 26px; height: 26px; margin: 0 auto 14px; border-radius: 50%;
+    border: 3px solid #30363d; border-top-color: #58a6ff; animation: sp .8s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #err { color: #f85149; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>Worka Remote</b>
+  <span id="who" class="stat"></span>
+  <select id="monitor" style="display:none"></select>
+  <span class="sp"></span>
+   <span id="stats" class="stat"></span>
+   <div id="tools">
+     <button id="clip" title="Sinkronisasi clipboard">Clipboard</button>
+     <button id="audio" title="Audio mesin tujuan">Audio</button>
+     <button id="sas" title="Kirim Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+     <button id="file" title="Kirim file; klik dua kali untuk unduh berdasarkan path">File</button>
+     <input id="fileinput" type="file" hidden>
+   </div>
+  <button id="fs" title="Layar penuh">⛶</button>
+  <button id="stop" title="Akhiri sesi">Akhiri</button>
+</div>
+<div id="wrap"><canvas id="screen" tabindex="0"></canvas></div>
+<div id="overlay">
+  <div id="card">
+    <div id="spinner" class="spin"></div>
+    <h1 id="title">Menghubungkan…</h1>
+    <p id="msg">Menyiapkan sesi.</p>
+    <div id="pw" class="row" style="display:none">
+      <input id="pwinput" type="password" placeholder="Password mesin tujuan" autocomplete="off">
+      <button id="pwgo" class="primary">Kirim</button>
+    </div>
+    <div id="actions" class="row" style="display:none">
+      <button id="reload" class="primary">Muat ulang</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("screen");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const back = document.createElement("canvas");
+  const bctx = back.getContext("2d", { alpha: false });
+
+  const params = new URLSearchParams(location.hash.slice(1));
+  const sid = params.get("sid");
+  const token = params.get("token");
+
+  let monitors = [];
+  let current = 0;
+  let view = { dx: 0, dy: 0, dw: 1, dh: 1 };
+  let drawPending = false;
+  let bytesIn = 0;
+  let frames = 0;
+  let ws = null;
+  let connected = false;
+  let clipboardOn = true;
+  let audioOn = false;
+  let clipTimer = null;
+  let audioCtx = null, audioAt = 0;
+  let videoDecoder = null, videoMode = false;
+  const downloads = new Map();
+  const pressed = new Map();
+
+  // ---- overlay helpers -------------------------------------------------
+  function state(title, msg, opts = {}) {
+    $("title").textContent = title;
+    $("msg").innerHTML = msg;
+    $("overlay").classList.remove("hide");
+    $("spinner").style.display = opts.spinner === false ? "none" : "block";
+    $("pw").style.display = opts.password ? "flex" : "none";
+    $("actions").style.display = opts.action ? "flex" : "none";
+    if (opts.password) setTimeout(() => $("pwinput").focus(), 30);
+  }
+
+  // ---- connection ------------------------------------------------------
+  if (!sid || !token) {
+    state("Tautan tidak lengkap", "Buka sesi dari panel, jangan dari URL ini.", { spinner: false });
+    return;
+  }
+  $("who").textContent = "sesi " + sid.slice(0, 8);
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/viewer?sid=${encodeURIComponent(sid)}&token=${encodeURIComponent(token)}`);
+  ws.binaryType = "arraybuffer";
+
+  const queue = [];
+  let busy = false;
+  async function pump() {
+    if (busy) return;
+    busy = true;
+    try {
+      while (queue.length) await handle(queue.shift());
+    } finally {
+      busy = false;
+    }
+  }
+
+  ws.onmessage = (ev) => {
+    queue.push(ev.data);
+    if (ev.data instanceof ArrayBuffer) bytesIn += ev.data.byteLength;
+    pump();
+  };
+  ws.onclose = () => {
+    if (connected) {
+      state("Sesi berakhir", "Koneksi ke mesin tujuan ditutup.", { spinner: false, action: true });
+    } else {
+      state("Gagal terhubung", "Sesi tidak valid, sudah dipakai, atau kedaluwarsa.", { spinner: false, action: true });
+    }
+    connected = false;
+  };
+  ws.onerror = () => {};
+
+  async function handle(data) {
+    if (typeof data === "string") {
+      let m;
+      try { m = JSON.parse(data); } catch { return; }
+      switch (m.t) {
+        case "waiting":
+          state("Menunggu persetujuan", "Mesin tujuan harus menerima permintaan ini.");
+          break;
+        case "need_password":
+          state("Butuh password", "Mesin ini memakai unattended access.", { spinner: false, password: true });
+          break;
+        case "connected":
+          connected = true;
+          $("overlay").classList.add("hide");
+          canvas.focus();
+          break;
+        case "denied":
+          state("Ditolak", m.reason === "denied" ? "Permintaan ditolak di mesin tujuan." : escapeHtml(m.reason), { spinner: false, action: true });
+          break;
+        case "end":
+          state("Sesi berakhir", escapeHtml(m.reason || "ditutup"), { spinner: false, action: true });
+          connected = false;
+          break;
+        case "screen":
+          setMonitors(m.monitors || []);
+          if (window.VideoDecoder) send({ t: "video", codec: "h264" });
+          break;
+        case "clipboard":
+          if (clipboardOn && navigator.clipboard) navigator.clipboard.writeText(m.text || "").catch(() => {});
+          break;
+        case "unsupported":
+          if (m.what === "video") { videoMode = false; send({ t: "video", codec: "jpeg" }); }
+          if (m.what === "audio") { audioOn = false; $("audio").textContent = "Audio"; }
+          if (m.what === "sas") state("Ctrl+Alt+Del tidak tersedia", "Agent belum berjalan sebagai service SYSTEM.", { spinner: false, action: true });
+          break;
+        case "file_accept":
+          if (upload) sendFileChunks(upload);
+          break;
+        case "file_offer":
+          downloads.set(m.id, { name: m.name, size: m.size, chunks: [] });
+          if (m.size) send({ t: "file_accept", id: m.id });
+          break;
+        case "file_done":
+          finishDownload(m);
+          break;
+      }
+      return;
+    }
+    const kind = new Uint8Array(data)[0];
+    if (kind === 1) drawTiles(data);
+    else if (kind === 2) receiveFile(data);
+    else if (kind === 3) playAudio(data);
+    else if (kind === 4) drawVideo(data);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---- monitors --------------------------------------------------------
+  function setMonitors(list) {
+    monitors = list;
+    const sel = $("monitor");
+    sel.innerHTML = "";
+    for (const m of list) {
+      const o = document.createElement("option");
+      o.value = m.i;
+      o.textContent = `${m.name || "Monitor " + (m.i + 1)} — ${m.w}×${m.h}${m.primary ? " (utama)" : ""}`;
+      sel.appendChild(o);
+    }
+    sel.style.display = list.length > 1 ? "" : "none";
+    const primary = list.find((m) => m.primary) || list[0];
+    if (primary) selectMonitor(primary.i);
+  }
+
+  function selectMonitor(i) {
+    const m = monitors.find((x) => x.i === i);
+    if (!m) return;
+    current = i;
+    $("monitor").value = String(i);
+    back.width = m.w;
+    back.height = m.h;
+    bctx.fillStyle = "#000";
+    bctx.fillRect(0, 0, m.w, m.h);
+    resize();
+    draw();
+  }
+
+  $("monitor").onchange = (e) => {
+    selectMonitor(Number(e.target.value));
+    send({ t: "monitor", i: current });
+  };
+
+  // ---- rendering -------------------------------------------------------
+  function drawTiles(buf) {
+    const dv = new DataView(buf);
+    if (dv.getUint8(0) !== 1) return;
+    const count = dv.getUint16(1, true);
+    let off = 3;
+    for (let i = 0; i < count; i++) {
+      if (off + 12 > buf.byteLength) return;
+      const x = dv.getUint16(off, true);
+      const y = dv.getUint16(off + 2, true);
+      const len = dv.getUint32(off + 8, true);
+      off += 12;
+      if (off + len > buf.byteLength) return;
+      const blob = new Blob([new Uint8Array(buf, off, len)], { type: "image/jpeg" });
+      off += len;
+      createImageBitmap(blob).then((bmp) => {
+        bctx.drawImage(bmp, x, y);
+        bmp.close();
+        scheduleDraw();
+      }).catch(() => {});
+    }
+    frames++;
+  }
+
+  function receiveFile(buf) {
+    const a = new Uint8Array(buf), n = a[1];
+    const id = new TextDecoder().decode(a.slice(2, 2 + n));
+    const d = downloads.get(id);
+    if (d) d.chunks.push(a.slice(2 + n));
+  }
+
+  function finishDownload(m) {
+    const d = downloads.get(m.id);
+    if (!d) return;
+    downloads.delete(m.id);
+    if (!m.ok) return;
+    const blob = new Blob(d.chunks, { type: "application/octet-stream" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = d.name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  function drawVideo(buf) {
+    if (!window.VideoDecoder) return;
+    const a = new Uint8Array(buf), flags = a[1];
+    const ts = new DataView(buf).getUint32(2, true);
+    const payload = a.slice(6);
+    if (!videoDecoder) {
+      videoDecoder = new VideoDecoder({ output: frame => {
+        bctx.drawImage(frame, 0, 0, back.width, back.height); frame.close(); scheduleDraw();
+      }, error: () => { videoMode = false; send({ t: "video", codec: "jpeg" }); }});
+      videoDecoder.configure({ codec: "avc1.42001f", optimizeForLatency: true, avc: { format: "annexb" } });
+    }
+    videoMode = true;
+    try { videoDecoder.decode(new EncodedVideoChunk({ type: flags & 1 ? "key" : "delta", timestamp: ts, data: payload })); } catch (_) {}
+  }
+
+  function playAudio(buf) {
+    if (!audioOn) return;
+    const a = new Uint8Array(buf), pcm = a.slice(3);
+    audioCtx ||= new AudioContext({ sampleRate: 48000 });
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+    const b = audioCtx.createBuffer(1, samples.length, 48000);
+    const ch = b.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) ch[i] = samples[i] / 32768;
+    const src = audioCtx.createBufferSource(); src.buffer = b; src.connect(audioCtx.destination);
+    audioAt = Math.max(audioAt, audioCtx.currentTime + .03); src.start(audioAt); audioAt += b.duration;
+  }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const r = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+    scheduleDraw();
+  }
+
+  function scheduleDraw() {
+    if (drawPending) return;
+    drawPending = true;
+    requestAnimationFrame(draw);
+  }
+
+  function draw() {
+    drawPending = false;
+    if (!back.width) return;
+    const cw = canvas.width, ch = canvas.height;
+    const s = Math.min(cw / back.width, ch / back.height);
+    const dw = Math.round(back.width * s), dh = Math.round(back.height * s);
+    const dx = Math.round((cw - dw) / 2), dy = Math.round((ch - dh) / 2);
+    view = { dx, dy, dw, dh };
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.imageSmoothingEnabled = s < 1.5;
+    ctx.drawImage(back, 0, 0, back.width, back.height, dx, dy, dw, dh);
+  }
+
+  new ResizeObserver(() => { resize(); draw(); }).observe(canvas);
+  window.addEventListener("resize", () => { resize(); draw(); });
+
+  // ---- input -----------------------------------------------------------
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function norm(e) {
+    const r = canvas.getBoundingClientRect();
+    const dpr = canvas.width / r.width;
+    const x = ((e.clientX - r.left) * dpr - view.dx) / view.dw;
+    const y = ((e.clientY - r.top) * dpr - view.dy) / view.dh;
+    return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+  }
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!connected) return;
+    const p = norm(e);
+    send({ t: "move", x: p.x, y: p.y });
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (!connected) return;
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    const p = norm(e);
+    send({ t: "button", x: p.x, y: p.y, button: e.button, down: true });
+    canvas.focus();
+  });
+
+  canvas.addEventListener("pointerup", (e) => {
+    if (!connected) return;
+    const p = norm(e);
+    send({ t: "button", x: p.x, y: p.y, button: e.button, down: false });
+  });
+
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  canvas.addEventListener("wheel", (e) => {
+    if (!connected) return;
+    e.preventDefault();
+    const p = norm(e);
+    const line = e.deltaMode === 1 ? 100 : e.deltaMode === 2 ? 400 : 1;
+    send({ t: "wheel", x: p.x, y: p.y, dx: Math.round(e.deltaX * line), dy: Math.round(-e.deltaY * line) });
+  }, { passive: false });
+
+  function mods(e) {
+    return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (!connected) return;
+    if (e.key === "F11") return;
+    e.preventDefault();
+    if (e.repeat) return;
+    pressed.set(e.code, e.key);
+    send({ t: "key", code: e.code, key: e.key, down: true, mods: mods(e) });
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (!connected) return;
+    e.preventDefault();
+    pressed.delete(e.code);
+    send({ t: "key", code: e.code, key: e.key, down: false, mods: mods(e) });
+  });
+
+  window.addEventListener("blur", () => {
+    for (const [code, key] of pressed) send({ t: "key", code, key, down: false, mods: 0 });
+    pressed.clear();
+  });
+
+  // ---- chrome ----------------------------------------------------------
+  $("pwgo").onclick = () => {
+    const v = $("pwinput").value;
+    if (!v) return;
+    send({ t: "password", password: v });
+    state("Memeriksa password", "Menunggu mesin tujuan.", { spinner: true });
+  };
+  $("pwinput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("pwgo").click();
+    e.stopPropagation();
+  });
+  let upload = null;
+  async function sendFileChunks(f) {
+    const data = f.file;
+    for (let off = 0; off < data.size; off += 65536) {
+      const part = new Uint8Array(await data.slice(off, off + 65536).arrayBuffer());
+      const idb = new TextEncoder().encode(f.id), out = new Uint8Array(2 + idb.length + part.length);
+      out[0] = 2; out[1] = idb.length; out.set(idb, 2); out.set(part, 2 + idb.length); ws.send(out);
+    }
+    upload = null;
+  }
+  $("file").onclick = () => $("fileinput").click();
+  $("fileinput").onchange = () => {
+    const f = $("fileinput").files[0]; if (!f) return;
+    upload = { id: crypto.randomUUID().replaceAll("-", "").slice(0, 20), file: f };
+    send({ t: "file_offer", id: upload.id, name: f.name, size: f.size });
+  };
+  $("clip").onclick = () => {
+    clipboardOn = !clipboardOn; $("clip").textContent = clipboardOn ? "Clipboard" : "Clipboard off";
+    if (clipTimer) clearInterval(clipTimer);
+    if (clipboardOn) clipTimer = setInterval(async () => {
+      if (!connected || !navigator.clipboard?.readText) return;
+      try { const text = await navigator.clipboard.readText(); if (text && text !== lastClipboard) { lastClipboard = text; send({ t: "clipboard", text }); } } catch (_) {}
+    }, 1500);
+  };
+  $("audio").onclick = async () => { audioOn = !audioOn; if (audioOn) { audioCtx ||= new AudioContext({ sampleRate: 48000 }); await audioCtx.resume(); } send({ t: "audio", on: audioOn }); $("audio").textContent = audioOn ? "Audio on" : "Audio"; };
+  $("sas").onclick = () => send({ t: "sas" });
+  let lastClipboard = "";
+  clipTimer = setInterval(async () => {
+    if (!connected || !clipboardOn || !navigator.clipboard?.readText) return;
+    try { const text = await navigator.clipboard.readText(); if (text && text !== lastClipboard) { lastClipboard = text; send({ t: "clipboard", text }); } } catch (_) {}
+  }, 1500);
+  $("file").ondblclick = () => {
+    const path = prompt("Path file pada mesin tujuan untuk diunduh:");
+    if (path) { const id = crypto.randomUUID().replaceAll("-", "").slice(0, 20); downloads.set(id, { name: path.split(/[\\/]/).pop(), size: 0, chunks: [] }); send({ t: "file_get", id, path }); }
+  };
+  $("reload").onclick = () => location.reload();
+  $("stop").onclick = () => { if (ws) ws.close(); };
+  $("fs").onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().then(() => navigator.keyboard?.lock?.(["Tab","Escape","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"])).catch(() => {});
+  };
+
+  window.addEventListener("paste", (e) => {
+    if (!connected || !clipboardOn) return;
+    const text = e.clipboardData?.getData("text"); if (text) send({ t: "clipboard", text });
+  });
+
+  setInterval(() => {
+    const kb = bytesIn / 1024;
+    $("stats").textContent = `${frames} fps · ${kb.toFixed(0)} KB`;
+    frames = 0;
+    bytesIn = 0;
+  }, 1000);
+
+  canvas.focus();
+})();
+</script>
+</body>
+</html>

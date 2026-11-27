@@ -1,0 +1,28 @@
+[package]
+name = "worka-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "worka_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "worka-server"
+path = "src/main.rs"
+
+[dependencies]
+proto = { path = "../proto" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+axum = { version = "=0.7.5", features = ["ws"] }
+futures-util = { version = "=0.3.31", default-features = false, features = ["sink"] }
+rand = "=0.8.5"
+
+[dev-dependencies]
+tower = { version = "=0.4.13", features = ["util"] }
+tokio-tungstenite = "=0.21.0"
